@@ -450,38 +450,7 @@ var isFetching = false;
 var fetchLog = [];
 
 // Wraps fetch in a race against a timeout — always resolves, never rejects
-// Try to fetch JSON from a URL — resolves null on any failure
-function fetchJSONSafe(url, timeoutMs) {
-  return new Promise(function(resolve) {
-    var done = false;
-    var timer = setTimeout(function() {
-      if (!done) { done = true; resolve(null); }
-    }, timeoutMs);
-
-    // Try fetch() first
-    fetch(url, { cache: 'no-store', mode: 'cors' })
-      .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(d) { if (!done) { done = true; clearTimeout(timer); resolve(d); } })
-      .catch(function() {
-        // fetch() failed — try XHR as fallback (different CORS handling in some browsers)
-        if (done) return;
-        try {
-          var xhr = new XMLHttpRequest();
-          xhr.open('GET', url, true);
-          xhr.timeout = timeoutMs;
-          xhr.onload = function() {
-            if (done) return;
-            done = true; clearTimeout(timer);
-            try { resolve(JSON.parse(xhr.responseText)); } catch(e) { resolve(null); }
-          };
-          xhr.onerror = function() { if (!done) { done = true; clearTimeout(timer); resolve(null); } };
-          xhr.ontimeout = function() { if (!done) { done = true; clearTimeout(timer); resolve(null); } };
-          xhr.send();
-        } catch(e) { if (!done) { done = true; clearTimeout(timer); resolve(null); } }
-      });
-  });
-}
-
+// Fetch gold price — tries direct then two proxies, 5s timeout each
 function fetchAllSources() {
   fetchLog = [];
 
@@ -496,28 +465,31 @@ function fetchAllSources() {
   var GOLD_API = 'https://api.gold-api.com/price/XAU';
 
   var sources = [
-    // 1. Direct — works fine on https:// hosted pages
-    { name: 'gold-api (direct)', url: GOLD_API, parse: parseGoldApi },
-    // 2. thingproxy — reliable CORS proxy that accepts all origins including file://
-    { name: 'gold-api (thingproxy)', url: 'https://thingproxy.freeboard.io/fetch/' + GOLD_API, parse: parseGoldApi },
-    // 3. corsproxy.io
-    { name: 'gold-api (corsproxy)', url: 'https://corsproxy.io/?' + encodeURIComponent(GOLD_API), parse: parseGoldApi },
-    // 4. allorigins
-    { name: 'gold-api (allorigins)', url: 'https://api.allorigins.win/raw?url=' + encodeURIComponent(GOLD_API), parse: parseGoldApi },
-    // 5. jsonp.afeld.me — another open proxy
-    { name: 'gold-api (cors.sh)', url: 'https://cors.sh/' + GOLD_API, parse: parseGoldApi },
+    { name: 'direct',     url: GOLD_API },
+    { name: 'corsproxy',  url: 'https://corsproxy.io/?' + encodeURIComponent(GOLD_API) },
+    { name: 'openproxy',  url: 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(GOLD_API) },
   ];
+
+  function tryOne(src) {
+    return new Promise(function(resolve) {
+      var settled = false;
+      function done(val) { if (!settled) { settled = true; resolve(val); } }
+      setTimeout(function() { done(null); }, 5000);
+      fetch(src.url, { cache: 'no-store' })
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(d) { done(parseGoldApi(d)); })
+        .catch(function() { done(null); });
+    });
+  }
 
   function tryNext(i) {
     if (i >= sources.length) return Promise.resolve(null);
-    var src = sources[i];
-    return fetchJSONSafe(src.url, 6000).then(function(d) {
-      var result = d ? src.parse(d) : null;
+    return tryOne(sources[i]).then(function(result) {
       if (result) {
-        fetchLog.push(src.name + ': ✓ $' + result.price.toFixed(2));
+        fetchLog.push(sources[i].name + ': OK $' + result.price.toFixed(2));
         return result;
       }
-      fetchLog.push(src.name + ': failed');
+      fetchLog.push(sources[i].name + ': failed');
       return tryNext(i + 1);
     });
   }
@@ -835,6 +807,7 @@ function tzTime(tz) { return new Date().toLocaleTimeString('en-GB', { timeZone: 
 
 function renderSessions() {
   if (!document.getElementById('sessionsGrid')) return;
+  if (!SESS || SESS.length < 4) return;
   var lonOpen = sessOpen(SESS[2]), nyOpen = sessOpen(SESS[3]);
   var ob = document.getElementById('overlapBanner');
   if (!ob) return;
