@@ -450,24 +450,42 @@ var isFetching = false;
 var fetchLog = [];
 
 // Wraps fetch in a race against a timeout — always resolves, never rejects
+// Try to fetch JSON from a URL — resolves null on any failure
 function fetchJSONSafe(url, timeoutMs) {
-  var timeoutPromise = new Promise(function(resolve) {
-    setTimeout(function() { resolve({ __timeout: true }); }, timeoutMs);
+  return new Promise(function(resolve) {
+    var done = false;
+    var timer = setTimeout(function() {
+      if (!done) { done = true; resolve(null); }
+    }, timeoutMs);
+
+    // Try fetch() first
+    fetch(url, { cache: 'no-store', mode: 'cors' })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(d) { if (!done) { done = true; clearTimeout(timer); resolve(d); } })
+      .catch(function() {
+        // fetch() failed — try XHR as fallback (different CORS handling in some browsers)
+        if (done) return;
+        try {
+          var xhr = new XMLHttpRequest();
+          xhr.open('GET', url, true);
+          xhr.timeout = timeoutMs;
+          xhr.onload = function() {
+            if (done) return;
+            done = true; clearTimeout(timer);
+            try { resolve(JSON.parse(xhr.responseText)); } catch(e) { resolve(null); }
+          };
+          xhr.onerror = function() { if (!done) { done = true; clearTimeout(timer); resolve(null); } };
+          xhr.ontimeout = function() { if (!done) { done = true; clearTimeout(timer); resolve(null); } };
+          xhr.send();
+        } catch(e) { if (!done) { done = true; clearTimeout(timer); resolve(null); } }
+      });
   });
-  var fetchPromise = fetch(url, { cache: 'no-store' })
-    .then(function(r) {
-      if (!r.ok) return { __httpError: r.status };
-      return r.json();
-    })
-    .catch(function(e) { return { __fetchError: e.message || 'network error' }; });
-  return Promise.race([fetchPromise, timeoutPromise]);
 }
 
-// Try each source IN ORDER, stop at first success
 function fetchAllSources() {
   fetchLog = [];
 
-  // gold-api.com returns grams (~$130/g) → multiply by 31.1035 for troy oz
+  // gold-api.com returns price per GRAM — multiply by 31.1035 for troy ounce
   function parseGoldApi(d) {
     if (d && typeof d.price === 'number' && d.price > 80 && d.price < 500) {
       return { price: d.price * 31.1035, source: 'gold-api.com', time: d.updatedAtReadable || 'just now' };
@@ -476,52 +494,30 @@ function fetchAllSources() {
   }
 
   var GOLD_API = 'https://api.gold-api.com/price/XAU';
-  // corsproxy.io works from file:// origins and has good uptime
-  var GOLD_API_PROXY = 'https://corsproxy.io/?' + encodeURIComponent(GOLD_API);
 
   var sources = [
-    {
-      // Direct — works when CORS headers are present (usually fine on desktop)
-      name: 'gold-api.com (direct)',
-      url: GOLD_API,
-      extract: parseGoldApi
-    },
-    {
-      // Via corsproxy.io — works even from file:// and mobile content:// origins
-      name: 'gold-api.com (proxy)',
-      url: GOLD_API_PROXY,
-      extract: parseGoldApi
-    },
-    {
-      // Second proxy option: allorigins (different infrastructure = different failure modes)
-      name: 'gold-api.com (allorigins)',
-      url: 'https://api.allorigins.win/raw?url=' + encodeURIComponent(GOLD_API),
-      extract: parseGoldApi
-    }
+    // 1. Direct — works fine on https:// hosted pages
+    { name: 'gold-api (direct)', url: GOLD_API, parse: parseGoldApi },
+    // 2. thingproxy — reliable CORS proxy that accepts all origins including file://
+    { name: 'gold-api (thingproxy)', url: 'https://thingproxy.freeboard.io/fetch/' + GOLD_API, parse: parseGoldApi },
+    // 3. corsproxy.io
+    { name: 'gold-api (corsproxy)', url: 'https://corsproxy.io/?' + encodeURIComponent(GOLD_API), parse: parseGoldApi },
+    // 4. allorigins
+    { name: 'gold-api (allorigins)', url: 'https://api.allorigins.win/raw?url=' + encodeURIComponent(GOLD_API), parse: parseGoldApi },
+    // 5. jsonp.afeld.me — another open proxy
+    { name: 'gold-api (cors.sh)', url: 'https://cors.sh/' + GOLD_API, parse: parseGoldApi },
   ];
 
   function tryNext(i) {
     if (i >= sources.length) return Promise.resolve(null);
     var src = sources[i];
-    return fetchJSONSafe(src.url, 5000).then(function(d) {
-      if (d && d.__timeout) {
-        fetchLog.push(src.name + ': timed out (5s)');
-        return tryNext(i + 1);
-      }
-      if (d && d.__httpError) {
-        fetchLog.push(src.name + ': HTTP ' + d.__httpError);
-        return tryNext(i + 1);
-      }
-      if (d && d.__fetchError) {
-        fetchLog.push(src.name + ': ' + d.__fetchError);
-        return tryNext(i + 1);
-      }
-      var result = src.extract(d);
+    return fetchJSONSafe(src.url, 6000).then(function(d) {
+      var result = d ? src.parse(d) : null;
       if (result) {
-        fetchLog.push(src.name + ': OK ($' + result.price.toFixed(2) + ')');
+        fetchLog.push(src.name + ': ✓ $' + result.price.toFixed(2));
         return result;
       }
-      fetchLog.push(src.name + ': bad data');
+      fetchLog.push(src.name + ': failed');
       return tryNext(i + 1);
     });
   }
