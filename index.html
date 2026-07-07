@@ -450,35 +450,38 @@ var isFetching = false;
 var fetchLog = [];
 
 // Wraps fetch in a race against a timeout — always resolves, never rejects
-// Fetch gold price — tries direct then two proxies, 5s timeout each
+// Fetch gold price from gold-api.com
+// gold-api.com returns price as troy ounce (e.g. ~$4600-5000), no conversion needed.
+// Called directly — works fine from https:// hosted pages with no proxy needed.
 function fetchAllSources() {
   fetchLog = [];
 
-  // gold-api.com returns price per GRAM — multiply by 31.1035 for troy ounce
   function parseGoldApi(d) {
-    if (d && typeof d.price === 'number' && d.price > 80 && d.price < 500) {
-      return { price: d.price * 31.1035, source: 'gold-api.com', time: d.updatedAtReadable || 'just now' };
+    // gold-api.com returns troy ounce price directly in the 'price' field
+    if (d && typeof d.price === 'number' && d.price > 1000 && d.price < 20000) {
+      return { price: d.price, source: 'gold-api.com', time: d.updatedAtReadable || 'just now' };
     }
+    // Log what we actually got to help diagnose future issues
+    fetchLog.push('gold-api data: ' + JSON.stringify(d).slice(0, 80));
     return null;
   }
 
   var GOLD_API = 'https://api.gold-api.com/price/XAU';
 
   var sources = [
-    { name: 'direct',     url: GOLD_API },
-    { name: 'corsproxy',  url: 'https://corsproxy.io/?' + encodeURIComponent(GOLD_API) },
-    { name: 'openproxy',  url: 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(GOLD_API) },
+    { name: 'gold-api (direct)',    url: GOLD_API },
+    { name: 'gold-api (corsproxy)', url: 'https://corsproxy.io/?' + encodeURIComponent(GOLD_API) },
   ];
 
   function tryOne(src) {
     return new Promise(function(resolve) {
       var settled = false;
-      function done(val) { if (!settled) { settled = true; resolve(val); } }
-      setTimeout(function() { done(null); }, 5000);
+      function finish(val) { if (!settled) { settled = true; resolve(val); } }
+      setTimeout(function() { finish(null); }, 6000);
       fetch(src.url, { cache: 'no-store' })
         .then(function(r) { return r.ok ? r.json() : null; })
-        .then(function(d) { done(parseGoldApi(d)); })
-        .catch(function() { done(null); });
+        .then(function(d) { finish(parseGoldApi(d)); })
+        .catch(function(e) { fetchLog.push(src.name + ' err: ' + e.message); finish(null); });
     });
   }
 
@@ -489,7 +492,7 @@ function fetchAllSources() {
         fetchLog.push(sources[i].name + ': OK $' + result.price.toFixed(2));
         return result;
       }
-      fetchLog.push(sources[i].name + ': failed');
+      fetchLog.push(sources[i].name + ': no valid data');
       return tryNext(i + 1);
     });
   }
